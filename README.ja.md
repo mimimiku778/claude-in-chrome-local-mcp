@@ -48,7 +48,7 @@ Claude Desktop を後からインストールした場合は、`./install-local-
 - macOS / Linux
 - Claude Code
 - Google Chrome + [Claude in Chrome 拡張機能](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
-- Python 3
+- Python 3.10+
 - Claude Desktop（任意）
 
 公式の Linux 版 Claude Desktop はありません。[claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) を使用してください。
@@ -180,7 +180,3 @@ let config = {
 ```
 
 つまり、ローカルソケットへの接続コードは存在するのに、LaunchDarkly が常に `true` を返すため WSS リレーが優先され、ローカルソケットは使われません。本プロジェクトはこのフラグを迂回し、ソケットに直接接続します。
-
-## ライセンス
-
-[MIT](LICENSE)

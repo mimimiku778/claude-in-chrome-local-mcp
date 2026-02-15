@@ -29,7 +29,8 @@ case "$OS" in
         MANIFEST_DIR="${HOME}/.config/google-chrome/NativeMessagingHosts"
         ;;
     Darwin)
-        MANIFEST_DIR="${HOME}/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+        echo "macOS does not need this script — Claude Desktop sets up native messaging automatically."
+        exit 0
         ;;
     *)
         error "Unsupported OS: ${OS}"

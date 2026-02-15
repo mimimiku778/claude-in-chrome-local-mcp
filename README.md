@@ -48,7 +48,7 @@ If you install Claude Desktop later, re-run `./install-local-mcp.sh`.
 - macOS / Linux
 - Claude Code
 - Google Chrome + [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
-- Python 3
+- Python 3.10+
 - Claude Desktop (optional)
 
 No official Linux build of Claude Desktop is available. Use [claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian).
@@ -180,7 +180,3 @@ let config = {
 ```
 
 The local socket code exists but is never used — LaunchDarkly always returns `true`, so the WSS relay takes priority. This project bypasses that flag and connects to the socket directly.
-
-## License
-
-[MIT](LICENSE)

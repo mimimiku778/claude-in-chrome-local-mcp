@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import struct
 import sys
@@ -323,7 +324,7 @@ class MCPServer:
         """Send a tool request to the socket and wait for the response."""
         self.request_counter += 1
         req_key = self.request_counter
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_key] = future
 
         self._write_socket({
@@ -450,7 +451,6 @@ class MCPServer:
                 if isinstance(item, dict) and item.get("type") == "text":
                     text = item["text"]
                     if "Executed on tabId:" in text:
-                        import re
                         m = re.search(r"Executed on tabId:\s*(\d+)", text)
                         if m:
                             self.active_tab_id = int(m.group(1))
@@ -483,7 +483,7 @@ class MCPServer:
                 self.tab_group_initialized = False
                 if await self._connect_socket():
                     interval = RECONNECT_INTERVAL
-                    asyncio.get_event_loop().create_task(self._read_socket_loop())
+                    asyncio.get_running_loop().create_task(self._read_socket_loop())
                 else:
                     interval = min(interval * 1.5, MAX_RECONNECT_INTERVAL)
             await asyncio.sleep(interval)
@@ -576,7 +576,7 @@ class MCPServer:
         self.request_counter += 1
         req_key = self.request_counter
 
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_key] = future
 
         socket_msg = {
@@ -713,7 +713,7 @@ class MCPServer:
 
     async def _read_stdin_loop(self) -> None:
         """Read JSON-RPC messages from stdin (line-delimited)."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)

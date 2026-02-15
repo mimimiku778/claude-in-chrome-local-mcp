@@ -5,7 +5,18 @@ set -euo pipefail
 # This lets Claude Desktop use Claude Code's tools (file editing, bash, etc.)
 # via the MCP connector.
 
-CONFIG_DIR="${HOME}/.config/Claude"
+case "$(uname -s)" in
+    Linux)
+        CONFIG_DIR="${HOME}/.config/Claude"
+        ;;
+    Darwin)
+        CONFIG_DIR="${HOME}/Library/Application Support/Claude"
+        ;;
+    *)
+        echo "Unsupported OS: $(uname -s)" >&2
+        exit 1
+        ;;
+esac
 CONFIG_FILE="${CONFIG_DIR}/claude_desktop_config.json"
 
 RED='\033[0;31m'
