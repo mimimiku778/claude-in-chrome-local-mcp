@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""
+MCP server for Claude Code that bridges to the Chrome extension via Unix socket.
+
+Connects to the existing chrome-native-host Unix socket to proxy MCP tool calls
+to the "Claude in Chrome" browser extension.
+
+Architecture:
+  Claude Code <--stdio MCP (JSON-RPC)--> this script <--unix socket--> chrome-native-host <--native messaging--> Chrome Extension
+
+The chrome-native-host creates a Unix socket server at:
+  /tmp/claude-mcp-browser-bridge-{USERNAME}/{PID}.sock
+
+This script connects to that socket as a client and translates between:
+  - MCP protocol (JSON-RPC over stdin/stdout) on the Claude Code side
+  - 4-byte little-endian length prefix + JSON on the socket side
+
+Chrome extension v1.0.49+ requires:
+  1. Tool names use internal names (e.g. "navigate" not "browser_navigate")
+  2. An MCP tab group must be initialized via tabs_context_mcp before use
+  3. Each tool call must include a tabId in args
+"""
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import struct
+import sys
+
+LOG_DIR = os.path.expanduser("~/.config/Claude/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "claude-code-chrome-mcp.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("claude-code-chrome-mcp")
+
+USERNAME = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+SOCKET_DIR = os.environ.get(
+    "CHROME_MCP_SOCKET_DIR",
+    f"/tmp/claude-mcp-browser-bridge-{USERNAME}",
+)
+
+# Reconnect settings
+RECONNECT_INTERVAL = 2.0
+MAX_RECONNECT_INTERVAL = 30.0
+
+# MCP tool name -> Chrome extension internal tool name mapping.
+# The extension uses short names internally while the MCP interface
+# exposes "browser_*" names for Claude Code compatibility.
+TOOL_NAME_MAP = {
+    "browser_navigate": "navigate",
+    "browser_click": "computer",
+    "browser_type": "computer",
+    "browser_snapshot": "read_page",
+    "browser_scroll": "computer",
+    "browser_tab_list": "tabs_context_mcp",
+    "browser_tab_switch": "navigate",
+    "browser_tab_close": "tabs_context",
+    "browser_tab_new": "tabs_create_mcp",
+    "browser_screen_capture": "computer",
+    "browser_console_messages": "read_console_messages",
+    "browser_js_eval": "javascript_tool",
+}
+
+# Known browser tools provided by the Chrome extension.
+# These are the tools that "Claude in Chrome" exposes for browser control.
+BROWSER_TOOLS = [
+    {
+        "name": "browser_navigate",
+        "description": "Navigate the browser to a URL",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to navigate to"}
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_click",
+        "description": "Click on an element in the browser page",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector or descriptive text to identify the element to click",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Reference ID of the element to click (from a previous snapshot)",
+                },
+            },
+        },
+    },
+    {
+        "name": "browser_type",
+        "description": "Type text into a focused element or a specified element in the browser",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text to type"},
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the element to type into",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Reference ID of the element to type into (from a previous snapshot)",
+                },
+                "pressEnter": {
+                    "type": "boolean",
+                    "description": "Whether to press Enter after typing",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "browser_snapshot",
+        "description": "Take an accessibility snapshot of the current page, returning a structured representation of the page content",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "browser_scroll",
+        "description": "Scroll the browser page up or down",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "Direction to scroll",
+                },
+                "amount": {
+                    "type": "number",
+                    "description": "Number of pixels to scroll (default: one viewport height)",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the element to scroll within",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Reference ID of the element to scroll within (from a previous snapshot)",
+                },
+            },
+            "required": ["direction"],
+        },
+    },
+    {
+        "name": "browser_tab_list",
+        "description": "List all open browser tabs",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "browser_tab_switch",
+        "description": "Switch to a specific browser tab",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {
+                    "type": "number",
+                    "description": "The ID of the tab to switch to",
+                }
+            },
+            "required": ["tabId"],
+        },
+    },
+    {
+        "name": "browser_tab_close",
+        "description": "Close a browser tab",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {
+                    "type": "number",
+                    "description": "The ID of the tab to close (closes current tab if not specified)",
+                }
+            },
+        },
+    },
+    {
+        "name": "browser_tab_new",
+        "description": "Open a new browser tab",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to open in the new tab (opens blank tab if not specified)",
+                }
+            },
+        },
+    },
+    {
+        "name": "browser_screen_capture",
+        "description": "Capture a screenshot of the current browser tab",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "browser_console_messages",
+        "description": "Get recent console messages from the browser",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "number",
+                    "description": "Number of recent messages to return (default: 20)",
+                }
+            },
+        },
+    },
+    {
+        "name": "browser_js_eval",
+        "description": "Execute JavaScript code in the browser page",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "JavaScript code to execute",
+                }
+            },
+            "required": ["code"],
+        },
+    },
+]
+
+
+class MCPServer:
+    """MCP server that proxies tool calls to the Chrome extension via Unix socket."""
+
+    def __init__(self):
+        self.running = True
+        self.socket_reader: asyncio.StreamReader | None = None
+        self.socket_writer: asyncio.StreamWriter | None = None
+        self.socket_connected = False
+        self.pending_requests: dict[str | int, asyncio.Future] = {}
+        self.request_counter = 0
+        self.socket_buf = b""
+        self.stdin_buf = b""
+        # Active tab tracking for auto-injection
+        self.active_tab_id: int | None = None
+        self.tab_group_id: int | None = None
+        self.tab_group_initialized = False
+
+    # -- stdio helpers (MCP JSON-RPC) -----------------------------------------
+
+    def _write_stdout(self, msg: dict) -> None:
+        """Write a JSON-RPC message to stdout for Claude Code."""
+        data = json.dumps(msg, separators=(",", ":")) + "\n"
+        sys.stdout.write(data)
+        sys.stdout.flush()
+
+    # -- Socket communication (4-byte LE length prefix + JSON) ----------------
+
+    def _find_socket_paths(self) -> list[str]:
+        """Find all available socket files in the socket directory."""
+        paths = []
+        if not os.path.isdir(SOCKET_DIR):
+            return paths
+        try:
+            for name in os.listdir(SOCKET_DIR):
+                if name.endswith(".sock"):
+                    paths.append(os.path.join(SOCKET_DIR, name))
+        except OSError:
+            pass
+        return paths
+
+    async def _connect_socket(self) -> bool:
+        """Connect to the chrome-native-host Unix socket.
+
+        Tries all .sock files in the socket directory until one succeeds.
+        """
+        socket_paths = self._find_socket_paths()
+        if not socket_paths:
+            log.warning("No sockets found in %s", SOCKET_DIR)
+            return False
+        for path in socket_paths:
+            try:
+                self.socket_reader, self.socket_writer = (
+                    await asyncio.open_unix_connection(path)
+                )
+                self.socket_connected = True
+                log.info("Connected to chrome-native-host socket at %s", path)
+                return True
+            except Exception as exc:
+                log.debug("Failed to connect to socket %s: %s", path, exc)
+                continue
+        log.warning("Could not connect to any socket in %s", SOCKET_DIR)
+        self.socket_connected = False
+        return False
+
+    def _write_socket(self, msg: dict) -> None:
+        """Send a message to chrome-native-host via the Unix socket."""
+        if self.socket_writer is None:
+            log.warning("Socket not connected, cannot send message")
+            return
+        try:
+            data = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+            header = struct.pack("<I", len(data))
+            self.socket_writer.write(header + data)
+            log.debug("Sent to socket: %s", msg)
+        except Exception:
+            log.exception("Failed to write to socket")
+            self.socket_connected = False
+
+    async def _send_and_wait(self, tool: str, args: dict, timeout: float = 30.0) -> dict:
+        """Send a tool request to the socket and wait for the response."""
+        self.request_counter += 1
+        req_key = self.request_counter
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self.pending_requests[req_key] = future
+
+        self._write_socket({
+            "method": "execute_tool",
+            "params": {"tool": tool, "args": args},
+        })
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.pending_requests.pop(req_key, None)
+            return {"error": {"content": f"Timed out ({timeout}s)"}}
+
+    async def _read_socket_loop(self) -> None:
+        """Read messages from the Unix socket and dispatch responses."""
+        buf = b""
+        try:
+            while self.running and self.socket_reader:
+                data = await self.socket_reader.read(65536)
+                if not data:
+                    log.info("Socket disconnected (EOF)")
+                    break
+                buf += data
+                while len(buf) >= 4:
+                    length = struct.unpack("<I", buf[:4])[0]
+                    if length > 1024 * 1024:
+                        log.error("Socket message too large (%d bytes), dropping", length)
+                        buf = b""
+                        break
+                    if len(buf) < 4 + length:
+                        break
+                    payload = buf[4 : 4 + length]
+                    buf = buf[4 + length :]
+                    try:
+                        msg = json.loads(payload)
+                        self._handle_socket_response(msg)
+                    except Exception:
+                        log.exception("Failed to parse socket message")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Socket read error")
+        finally:
+            self.socket_connected = False
+            log.info("Socket read loop ended")
+
+    def _handle_socket_response(self, msg: dict) -> None:
+        """Handle a response from the Chrome extension via socket."""
+        log.debug("Socket response: %s", msg)
+        if "result" not in msg and "error" not in msg:
+            log.debug("Ignoring non-tool-response message: %s", msg)
+            return
+        for req_id, future in list(self.pending_requests.items()):
+            if not future.done():
+                future.set_result(msg)
+                del self.pending_requests[req_id]
+                break
+
+    # -- Tab group initialization ---------------------------------------------
+
+    async def _ensure_tab_group(self) -> bool:
+        """Initialize MCP tab group if not yet done. Returns True if ready."""
+        if self.tab_group_initialized and self.active_tab_id is not None:
+            return True
+
+        if not self.socket_connected:
+            return False
+
+        # Reset stale state before re-initializing
+        self.active_tab_id = None
+        self.tab_group_id = None
+        self.tab_group_initialized = False
+
+        # Call tabs_context_mcp with createIfEmpty to initialize or retrieve
+        result = await self._send_and_wait(
+            "tabs_context_mcp", {"createIfEmpty": True}
+        )
+        if "error" in result:
+            log.warning("Failed to init tab group: %s", result["error"])
+            return False
+
+        # Parse tab info from response
+        self._parse_tab_context(result)
+        return self.active_tab_id is not None
+
+    def _parse_tab_context(self, result: dict) -> None:
+        """Extract tabId and tabGroupId from a tabs_context_mcp response."""
+        try:
+            content = result.get("result", {}).get("content", [])
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item["text"]
+                    # Try parsing as JSON (first content block)
+                    try:
+                        data = json.loads(text)
+                        tabs = data.get("availableTabs", [])
+                        if tabs:
+                            # Pick the first non-chrome:// tab, or first tab
+                            for tab in tabs:
+                                url = tab.get("url", "")
+                                if not url.startswith("chrome://"):
+                                    self.active_tab_id = tab["tabId"]
+                                    break
+                            if self.active_tab_id is None:
+                                self.active_tab_id = tabs[0]["tabId"]
+                        if "tabGroupId" in data:
+                            self.tab_group_id = data["tabGroupId"]
+                        self.tab_group_initialized = True
+                        log.info(
+                            "Tab group initialized: tabId=%s groupId=%s",
+                            self.active_tab_id, self.tab_group_id,
+                        )
+                        return
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except Exception:
+            log.exception("Failed to parse tab context")
+
+    def _update_active_tab_from_response(self, result: dict) -> None:
+        """Update active_tab_id from tool response Tab Context info."""
+        try:
+            content = result.get("result", {}).get("content", [])
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item["text"]
+                    if "Executed on tabId:" in text:
+                        import re
+                        m = re.search(r"Executed on tabId:\s*(\d+)", text)
+                        if m:
+                            self.active_tab_id = int(m.group(1))
+                    # Also check for new tabs in context
+                    if "tabId" in text:
+                        try:
+                            data = json.loads(text)
+                            tabs = data.get("availableTabs", [])
+                            if tabs:
+                                for tab in tabs:
+                                    url = tab.get("url", "")
+                                    if not url.startswith("chrome://"):
+                                        self.active_tab_id = tab["tabId"]
+                                        break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+        except Exception:
+            pass
+
+    # -- Socket reconnection --------------------------------------------------
+
+    async def _maintain_socket_connection(self) -> None:
+        """Background task to maintain socket connection with reconnection."""
+        interval = RECONNECT_INTERVAL
+        while self.running:
+            if not self.socket_connected:
+                # Reset cached tab state so we re-initialize after reconnect
+                self.active_tab_id = None
+                self.tab_group_id = None
+                self.tab_group_initialized = False
+                if await self._connect_socket():
+                    interval = RECONNECT_INTERVAL
+                    asyncio.get_event_loop().create_task(self._read_socket_loop())
+                else:
+                    interval = min(interval * 1.5, MAX_RECONNECT_INTERVAL)
+            await asyncio.sleep(interval)
+
+    # -- MCP protocol handlers ------------------------------------------------
+
+    def _handle_initialize(self, request: dict) -> dict:
+        """Handle MCP initialize request."""
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                },
+                "serverInfo": {
+                    "name": "chrome-browser-mcp",
+                    "version": "1.1.0",
+                },
+            },
+        }
+
+    def _handle_initialized(self, request: dict) -> None:
+        """Handle MCP initialized notification (no response needed)."""
+        log.info("MCP client initialized")
+
+    def _handle_tools_list(self, request: dict) -> dict:
+        """Handle MCP tools/list request."""
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "tools": BROWSER_TOOLS,
+            },
+        }
+
+    async def _handle_tools_call(self, request: dict) -> dict:
+        """Handle MCP tools/call request by proxying to Chrome extension."""
+        params = request.get("params", {})
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        request_id = request.get("id")
+
+        log.info("Tool call: %s(%s)", tool_name, json.dumps(tool_args))
+
+        if not self.socket_connected:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Error: Chrome extension is not connected. Make sure Chrome is running with the 'Claude in Chrome' extension and the chrome-native-host bridge is active.",
+                        }
+                    ],
+                    "isError": True,
+                },
+            }
+
+        # Ensure tab group is initialized
+        if not await self._ensure_tab_group():
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Error: Could not initialize MCP tab group. Make sure Chrome has at least one tab open.",
+                        }
+                    ],
+                    "isError": True,
+                },
+            }
+
+        # Map MCP tool name to Chrome extension internal name
+        internal_name = TOOL_NAME_MAP.get(tool_name, tool_name)
+
+        # Auto-inject tabId if not present
+        if "tabId" not in tool_args and self.active_tab_id is not None:
+            tool_args["tabId"] = self.active_tab_id
+
+        # Auto-inject tabGroupId for tab group tools
+        if internal_name in ("tabs_context_mcp", "tabs_create_mcp", "tabs_context"):
+            if "tabGroupId" not in tool_args and self.tab_group_id is not None:
+                tool_args["tabGroupId"] = self.tab_group_id
+
+        self.request_counter += 1
+        req_key = self.request_counter
+
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self.pending_requests[req_key] = future
+
+        socket_msg = {
+            "method": "execute_tool",
+            "params": {
+                "tool": internal_name,
+                "args": tool_args,
+            },
+        }
+        self._write_socket(socket_msg)
+
+        try:
+            result = await asyncio.wait_for(future, timeout=60.0)
+
+            if "error" in result:
+                error_content = result["error"]
+                if isinstance(error_content, dict):
+                    error_content = error_content.get("content", error_content)
+                error_text = error_content if isinstance(error_content, str) else json.dumps(error_content, ensure_ascii=False)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Error: {error_text}",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
+
+            # Update active tab from response
+            self._update_active_tab_from_response(result)
+
+            # Format the result for MCP
+            tool_result = result.get("result", {})
+            if isinstance(tool_result, dict):
+                content = tool_result.get("content", tool_result)
+            else:
+                content = tool_result
+
+            if isinstance(content, list):
+                mcp_content = content
+            elif isinstance(content, str):
+                mcp_content = [{"type": "text", "text": content}]
+            else:
+                mcp_content = [{"type": "text", "text": json.dumps(content, indent=2, ensure_ascii=False)}]
+
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": mcp_content,
+                },
+            }
+
+        except asyncio.TimeoutError:
+            self.pending_requests.pop(req_key, None)
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Error: Timed out waiting for Chrome extension response (60s)",
+                        }
+                    ],
+                    "isError": True,
+                },
+            }
+
+    async def _handle_ping(self, request: dict) -> dict:
+        """Handle MCP ping request."""
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {},
+        }
+
+    # -- Main stdin processing ------------------------------------------------
+
+    async def _process_stdin_line(self, line: str) -> None:
+        """Process a single JSON-RPC message from stdin."""
+        line = line.strip()
+        if not line:
+            return
+
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            log.error("Failed to parse JSON-RPC message: %s", exc)
+            return
+
+        method = request.get("method", "")
+        log.debug("MCP request: method=%s id=%s", method, request.get("id"))
+
+        response = None
+
+        if method == "initialize":
+            response = self._handle_initialize(request)
+        elif method == "notifications/initialized":
+            self._handle_initialized(request)
+        elif method == "tools/list":
+            response = self._handle_tools_list(request)
+        elif method == "tools/call":
+            response = await self._handle_tools_call(request)
+        elif method == "ping":
+            response = await self._handle_ping(request)
+        elif method == "notifications/cancelled":
+            cancelled_id = request.get("params", {}).get("requestId")
+            if cancelled_id and cancelled_id in self.pending_requests:
+                future = self.pending_requests.pop(cancelled_id)
+                if not future.done():
+                    future.cancel()
+            log.info("Request %s cancelled", cancelled_id)
+        else:
+            if "id" in request:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request.get("id"),
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {method}",
+                    },
+                }
+            else:
+                log.debug("Ignoring unknown notification: %s", method)
+
+        if response is not None:
+            self._write_stdout(response)
+
+    async def _read_stdin_loop(self) -> None:
+        """Read JSON-RPC messages from stdin (line-delimited)."""
+        loop = asyncio.get_event_loop()
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+        try:
+            while self.running:
+                line = await reader.readline()
+                if not line:
+                    log.info("stdin EOF, shutting down")
+                    break
+                await self._process_stdin_line(line.decode("utf-8"))
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("stdin read error")
+        finally:
+            self.running = False
+
+    # -- Lifecycle ------------------------------------------------------------
+
+    def _shutdown(self) -> None:
+        self.running = False
+
+    async def run(self) -> None:
+        """Main entry point."""
+        log.info("Claude Code Chrome MCP server starting")
+
+        # Start background socket connection maintainer
+        socket_task = asyncio.create_task(self._maintain_socket_connection())
+
+        # Process stdin
+        try:
+            await self._read_stdin_loop()
+        finally:
+            self.running = False
+            socket_task.cancel()
+            try:
+                await socket_task
+            except asyncio.CancelledError:
+                pass
+            if self.socket_writer:
+                try:
+                    self.socket_writer.close()
+                    await self.socket_writer.wait_closed()
+                except Exception:
+                    pass
+            log.info("Claude Code Chrome MCP server stopped")
+
+
+def main() -> None:
+    server = MCPServer()
+
+    def sig_handler(_sig, _frame):
+        server._shutdown()
+
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    try:
+        asyncio.run(server.run())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        log.info("MCP server exited")
+
+
+if __name__ == "__main__":
+    main()
