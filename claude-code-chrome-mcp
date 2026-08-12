@@ -467,6 +467,12 @@ class MCPServer:
         # Per-MCP-run session id. Passed as session_scope so the extension uses
         # session-scoped tab groups (auto-cleanable) instead of the legacy shared one.
         self.session_id = uuid.uuid4().hex
+        # Tab group title for this session. The extension does
+        # `title: displayName ?? "Claude"`, so without this every project's group
+        # is named "Claude" and concurrent sessions are indistinguishable.
+        self.session_display_name = os.environ.get("CHROME_MCP_GROUP_NAME") or os.path.basename(
+            os.getcwd()
+        )
         # When multiple sockets are visible and no preferred socket is set, we
         # refuse to silently auto-pick one. The first tool call returns an error
         # asking the caller to use browser_list_profiles / browser_select_profile.
@@ -629,7 +635,10 @@ class MCPServer:
         params: dict = {
             "tool": tool,
             "args": args,
-            "session_scope": {"sessionId": self.session_id},
+            "session_scope": {
+                "sessionId": self.session_id,
+                "displayName": self.session_display_name,
+            },
         }
         if self.tab_group_id is not None and "tabGroupId" not in args:
             args["tabGroupId"] = self.tab_group_id
