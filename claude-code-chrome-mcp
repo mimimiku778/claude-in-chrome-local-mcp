@@ -50,6 +50,35 @@ SOCKET_DIR = os.environ.get(
 # CLI --socket overrides this at startup; browser_select_profile overrides at runtime.
 PREFERRED_SOCKET_ENV = os.environ.get("CHROME_MCP_SOCKET", "").strip() or None
 
+# Human-friendly names for sockets, e.g. {"work": "22154.sock"}, so callers can
+# say "work" instead of a PID. Sockets are named after the native host's PID and
+# nothing on the process identifies which Chrome profile it serves, so a name is
+# a convenience that goes stale on restart -- not a durable identity. The tools
+# say so plainly rather than silently attaching to the wrong profile.
+ALIAS_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "claude-code-chrome-mcp",
+    "profiles.json",
+)
+
+
+def load_aliases() -> dict:
+    try:
+        with open(ALIAS_FILE) as f:
+            aliases = json.load(f).get("aliases")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+    return aliases if isinstance(aliases, dict) else {}
+
+
+def save_aliases(aliases: dict) -> None:
+    os.makedirs(os.path.dirname(ALIAS_FILE), exist_ok=True)
+    tmp = ALIAS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"aliases": aliases}, f, indent=2)
+    os.replace(tmp, ALIAS_FILE)
+
+
 # Reconnect settings
 RECONNECT_INTERVAL = 2.0
 MAX_RECONNECT_INTERVAL = 30.0
@@ -438,13 +467,24 @@ BROWSER_TOOLS = [
     },
     {
         "name": "browser_select_profile",
-        "description": "Switch the MCP bridge to a different Chrome profile's socket. Pass either the full socket path or its filename (e.g. '12345.sock'). Use browser_list_profiles to see candidates.",
+        "description": "Switch the MCP bridge to a different Chrome profile. Pass a name bound with browser_bind_profile (e.g. 'work'), a socket filename (e.g. '12345.sock'), or a full socket path. Use browser_list_profiles to see candidates and which names are valid.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "socket": {"type": "string", "description": "Socket path or filename to connect to"},
+                "socket": {"type": "string", "description": "Bound name, socket filename, or full socket path"},
             },
             "required": ["socket"],
+        },
+    },
+    {
+        "name": "browser_bind_profile",
+        "description": "Give the currently selected Chrome profile a memorable name (e.g. 'work') so browser_select_profile can take that name instead of a PID-based socket filename. Sockets are named after the native host's PID, so re-bind after a Chrome restart; browser_list_profiles shows which names are still valid.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name to bind to the active socket, e.g. 'work'"},
+            },
+            "required": ["name"],
         },
     },
 ]
@@ -556,22 +596,45 @@ class MCPServer:
                 f"No Chrome profiles connected. Socket directory {SOCKET_DIR} has no .sock files. "
                 f"Make sure Chrome is running with the 'Claude in Chrome' extension installed."
             )
+        names_for: dict[str, list[str]] = {}
+        for name, sock in load_aliases().items():
+            names_for.setdefault(os.path.basename(str(sock)), []).append(name)
+
         lines = [f"Socket directory: {SOCKET_DIR}"]
         for p in paths:
+            base = os.path.basename(p)
             marker = "  * " if p == self.current_socket_path else "    "
-            lines.append(f"{marker}{os.path.basename(p)}  ({p})")
+            names = ", ".join(sorted(names_for.get(base, [])))
+            lines.append(f"{marker}{base}{f'  [{names}]' if names else ''}  ({p})")
         lines.append("")
         lines.append("'*' marks the currently active socket. Use browser_select_profile to switch.")
+        lines.append(
+            "Names in [brackets] are aliases and can be passed to browser_select_profile "
+            "instead of a socket filename; create one with browser_bind_profile."
+        )
         return self._text_result("\n".join(lines))
 
     async def _switch_socket(self, target: str) -> dict:
         """Disconnect from the current socket and reconnect to `target`.
 
-        `target` may be a full path or just a filename inside SOCKET_DIR.
-        Returns an MCP result dict describing the outcome.
+        `target` may be an alias created with browser_bind_profile, a full path,
+        or a filename inside SOCKET_DIR. Returns an MCP result dict describing
+        the outcome.
         """
+        alias = None
+        aliases = load_aliases()
+        if target in aliases:
+            alias, target = target, str(aliases[target])
+
         resolved = target if os.path.isabs(target) else os.path.join(SOCKET_DIR, target)
         if not os.path.exists(resolved):
+            if alias:
+                return self._error_result(
+                    f"Alias '{alias}' points at {os.path.basename(resolved)}, which no longer "
+                    "exists. Socket names change whenever Chrome restarts. Run "
+                    "browser_list_profiles, select the right socket with "
+                    "browser_select_profile, then re-bind with browser_bind_profile."
+                )
             return self._error_result(f"Socket not found: {resolved}")
 
         # Close the existing socket, drop tab-group cache, set preference, reconnect.
@@ -583,7 +646,29 @@ class MCPServer:
         # Explicit choice made — don't block subsequent calls.
         self.needs_profile_choice = False
         asyncio.get_running_loop().create_task(self._read_socket_loop())
-        return self._text_result(f"Connected to {resolved}")
+        via = f" (alias '{alias}')" if alias else ""
+        return self._text_result(f"Connected to {resolved}{via}")
+
+    def _bind_profile_result(self, name) -> dict:
+        """Remember the active socket under a human-friendly name."""
+        if not name or not isinstance(name, str):
+            return self._error_result("browser_bind_profile requires 'name'")
+        if not self.current_socket_path:
+            return self._error_result(
+                "No socket is selected yet. Use browser_list_profiles, then "
+                "browser_select_profile, before binding a name."
+            )
+        aliases = load_aliases()
+        aliases[name] = os.path.basename(self.current_socket_path)
+        try:
+            save_aliases(aliases)
+        except OSError as exc:
+            return self._error_result(f"Could not write {ALIAS_FILE}: {exc}")
+        return self._text_result(
+            f"Bound '{name}' to {aliases[name]}. Pass '{name}' to browser_select_profile. "
+            "Socket names change when Chrome restarts, so re-bind after one; "
+            "browser_list_profiles shows which names are currently valid."
+        )
 
     async def _close_socket(self) -> None:
         """Cleanly close the current socket connection if any."""
@@ -1148,6 +1233,9 @@ class MCPServer:
         # is made.
         if tool_name == "browser_list_profiles":
             return reply(self._list_profiles_result())
+
+        if tool_name == "browser_bind_profile":
+            return reply(self._bind_profile_result(tool_args.get("name")))
 
         if not self.socket_connected:
             return reply(self._error_result(
